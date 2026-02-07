@@ -7,7 +7,7 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env, Client, Agent, Secret, AuditEntry } from './types';
 import * as db from './db';
 import { encrypt, hashPassword, verifyPassword } from './crypto';
-import { html } from 'hono/html';
+import { html, raw } from 'hono/html';
 
 export const webRoutes = new Hono<{ Bindings: Env }>();
 
@@ -220,7 +220,7 @@ webRoutes.post('/login', async (c) => {
   
   const session = await db.createSession(c.env.DB, client.id);
   setCookie(c, 'session', session.id, { path: '/', httpOnly: true, sameSite: 'Lax' });
-  return redirect('/dashboard');
+  return c.redirect('/dashboard');
 });
 
 // Logout
@@ -230,7 +230,7 @@ webRoutes.post('/logout', async (c) => {
     await db.deleteSession(c.env.DB, sessionId);
   }
   deleteCookie(c, 'session');
-  return redirect('/login');
+  return c.redirect('/login');
 });
 
 // Dashboard
@@ -278,18 +278,22 @@ webRoutes.get('/secrets', async (c) => {
   
   const secrets = await db.listSecrets(c.env.DB, clientId);
   
-  const rows = secrets.map(s => html`
+  const rows = raw(secrets.map(s => html`
     <tr>
       <td><code class="token">${s.name}</code></td>
       <td>${s.provider}</td>
       <td class="text-muted">${s.created_at.split('T')[0]}</td>
       <td>
-        <form method="POST" action="/secrets/${s.id}/delete" onsubmit="return confirm('Delete this secret?');" style="margin: 0;">
-          <button type="submit" class="btn btn-danger btn-sm">Delete</button>
-        </form>
+        <div class="flex gap-2">
+          <a href="/secrets/${s.id}/reveal" class="btn btn-ghost btn-sm">Reveal</a>
+          <a href="/secrets/${s.id}/edit" class="btn btn-ghost btn-sm">Edit</a>
+          <form method="POST" action="/secrets/${s.id}/delete" onsubmit="return confirm('Delete this secret?');" style="margin: 0;">
+            <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+          </form>
+        </div>
       </td>
     </tr>
-  `).join('');
+  `).join(''));
   
   const content = html`
     <main>
@@ -338,15 +342,38 @@ webRoutes.get('/secrets/add', async (c) => {
               <select id="provider" name="provider" required>
                 <option value="anthropic">Anthropic (Claude)</option>
                 <option value="openai">OpenAI</option>
-                <option value="google">Google AI</option>
+                <option value="google">Google AI / Gemini</option>
+                <option value="aws">AWS</option>
+                <option value="github">GitHub</option>
+                <option value="cloudflare">Cloudflare</option>
+                <option value="notion">Notion</option>
+                <option value="brave">Brave Search</option>
+                <option value="elevenlabs">ElevenLabs</option>
+                <option value="doppler">Doppler</option>
                 <option value="other">Other</option>
               </select>
             </div>
             <div class="form-group">
               <label for="value">Secret Value</label>
-              <input type="password" id="value" name="value" required placeholder="sk-...">
+              <div style="display: flex; gap: 0.5rem;">
+                <input type="password" id="value" name="value" required placeholder="sk-..." style="flex: 1;">
+                <button type="button" onclick="toggleSecret()" class="btn btn-ghost" id="toggleBtn">Show</button>
+              </div>
               <small class="text-muted">Will be encrypted before storage</small>
             </div>
+            <script>
+              function toggleSecret() {
+                const input = document.getElementById('value');
+                const btn = document.getElementById('toggleBtn');
+                if (input.type === 'password') {
+                  input.type = 'text';
+                  btn.textContent = 'Hide';
+                } else {
+                  input.type = 'password';
+                  btn.textContent = 'Show';
+                }
+              }
+            </script>
             <div class="flex gap-2">
               <button type="submit" class="btn btn-primary">Save Secret</button>
               <a href="/secrets" class="btn btn-ghost">Cancel</a>
@@ -385,6 +412,152 @@ webRoutes.post('/secrets/:id/delete', async (c) => {
   return redirect('/secrets');
 });
 
+// Edit secret page
+webRoutes.get('/secrets/:id/edit', async (c) => {
+  const clientId = await getSessionClient(c);
+  if (!clientId) return redirect('/login');
+  
+  const id = c.req.param('id');
+  const secret = await db.getSecretById(c.env.DB, id, clientId);
+  
+  if (!secret) {
+    return c.redirect('/secrets');
+  }
+  
+  const providers = [
+    { value: 'anthropic', label: 'Anthropic (Claude)' },
+    { value: 'openai', label: 'OpenAI' },
+    { value: 'google', label: 'Google AI / Gemini' },
+    { value: 'aws', label: 'AWS' },
+    { value: 'github', label: 'GitHub' },
+    { value: 'cloudflare', label: 'Cloudflare' },
+    { value: 'notion', label: 'Notion' },
+    { value: 'brave', label: 'Brave Search' },
+    { value: 'elevenlabs', label: 'ElevenLabs' },
+    { value: 'doppler', label: 'Doppler' },
+    { value: 'other', label: 'Other' },
+  ];
+  
+  const providerOptions = raw(providers.map(p => 
+    `<option value="${p.value}"${p.value === secret.provider ? ' selected' : ''}>${p.label}</option>`
+  ).join(''));
+  
+  const content = html`
+    <main>
+      <div class="container" style="max-width: 600px;">
+        <h1>Edit Secret</h1>
+        <div class="card">
+          <form method="POST" action="/secrets/${id}/edit">
+            <div class="form-group">
+              <label for="name">Secret Name</label>
+              <input type="text" id="name" name="name" required value="${secret.name}" pattern="[A-Z0-9_]+">
+            </div>
+            <div class="form-group">
+              <label for="provider">Provider</label>
+              <select id="provider" name="provider" required>
+                ${providerOptions}
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="value">New Secret Value <span class="text-muted">(leave blank to keep current)</span></label>
+              <div style="display: flex; gap: 0.5rem;">
+                <input type="password" id="value" name="value" placeholder="Leave blank to keep current" style="flex: 1;">
+                <button type="button" onclick="toggleSecret()" class="btn btn-ghost" id="toggleBtn">Show</button>
+              </div>
+            </div>
+            <div class="flex gap-2">
+              <button type="submit" class="btn btn-primary">Save Changes</button>
+              <a href="/secrets" class="btn btn-ghost">Cancel</a>
+            </div>
+          </form>
+        </div>
+      </div>
+      <script>
+        function toggleSecret() {
+          const input = document.getElementById('value');
+          const btn = document.getElementById('toggleBtn');
+          if (input.type === 'password') {
+            input.type = 'text';
+            btn.textContent = 'Hide';
+          } else {
+            input.type = 'password';
+            btn.textContent = 'Show';
+          }
+        }
+      </script>
+    </main>
+  `;
+  return c.html(layout('Edit Secret', content, navBar('secrets')));
+});
+
+// Edit secret submit
+webRoutes.post('/secrets/:id/edit', async (c) => {
+  const clientId = await getSessionClient(c);
+  if (!clientId) return redirect('/login');
+  
+  const id = c.req.param('id');
+  const body = await c.req.parseBody();
+  const name = body.name as string;
+  const provider = body.provider as string;
+  const value = body.value as string;
+  
+  // Only encrypt new value if provided
+  let encryptedValue: string | undefined;
+  if (value && value.trim()) {
+    encryptedValue = await encrypt(value, getMasterKey(c.env));
+  }
+  
+  await db.updateSecret(c.env.DB, id, clientId, name, provider, encryptedValue);
+  return c.redirect('/secrets');
+});
+
+// Reveal secret value
+webRoutes.get('/secrets/:id/reveal', async (c) => {
+  const clientId = await getSessionClient(c);
+  if (!clientId) return redirect('/login');
+  
+  const id = c.req.param('id');
+  const secret = await db.getSecretById(c.env.DB, id, clientId);
+  
+  if (!secret) {
+    return c.redirect('/secrets');
+  }
+  
+  let value: string;
+  try {
+    const { decrypt } = await import('./crypto');
+    value = await decrypt(secret.encrypted_value, getMasterKey(c.env));
+  } catch (e) {
+    value = '[decryption failed]';
+  }
+  
+  const content = html`
+    <main>
+      <div class="container" style="max-width: 600px;">
+        <h1>Secret: ${secret.name}</h1>
+        <div class="card">
+          <div class="form-group">
+            <label>Provider</label>
+            <div class="text-muted">${secret.provider}</div>
+          </div>
+          <div class="form-group">
+            <label>Value</label>
+            <div style="background: var(--bg-tertiary); padding: 1rem; border-radius: 0.375rem; font-family: monospace; word-break: break-all;">
+              ${value}
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Created</label>
+            <div class="text-muted">${secret.created_at}</div>
+          </div>
+          <a href="/secrets" class="btn btn-ghost">← Back to Secrets</a>
+        </div>
+      </div>
+    </main>
+  `;
+  return c.html(layout('Secret Details', content, navBar('secrets')));
+});
+
 // Agents list
 webRoutes.get('/agents', async (c) => {
   const clientId = await getSessionClient(c);
@@ -392,19 +565,26 @@ webRoutes.get('/agents', async (c) => {
   
   const agents = await db.listAgents(c.env.DB, clientId);
   
-  const rows = agents.map(a => html`
+  const rows = raw(agents.map(a => html`
     <tr>
       <td><strong>${a.name}</strong></td>
-      <td><code class="token">${a.token.slice(0, 16)}...${a.token.slice(-4)}</code></td>
+      <td>
+        <code class="token">${a.token.slice(0, 16)}...${a.token.slice(-4)}</code>
+        <button type="button" class="btn btn-ghost btn-sm" style="margin-left: 0.5rem; padding: 0.25rem 0.5rem;" 
+                onclick="copyToken('${a.token}', this)">Copy</button>
+      </td>
       <td class="text-muted">${a.created_at.split('T')[0]}</td>
       <td class="text-muted">${a.last_seen_at?.split('T')[0] || 'Never'}</td>
       <td>
-        <form method="POST" action="/agents/${a.id}/delete" onsubmit="return confirm('Delete this agent?');" style="margin: 0;">
-          <button type="submit" class="btn btn-danger btn-sm">Delete</button>
-        </form>
+        <div class="flex gap-2">
+          <a href="/agents/${a.id}" class="btn btn-ghost btn-sm">Proxy Tokens</a>
+          <form method="POST" action="/agents/${a.id}/delete" onsubmit="return confirm('Delete this agent?');" style="margin: 0;">
+            <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+          </form>
+        </div>
       </td>
     </tr>
-  `).join('');
+  `).join(''));
   
   const content = html`
     <main>
@@ -435,6 +615,19 @@ webRoutes.get('/agents', async (c) => {
   -H "Content-Type: application/json"</code></pre>
         </div>
       </div>
+      <script>
+        function copyToken(token, btn) {
+          navigator.clipboard.writeText(token).then(() => {
+            const orig = btn.textContent;
+            btn.textContent = 'Copied!';
+            btn.style.color = 'var(--accent)';
+            setTimeout(() => {
+              btn.textContent = orig;
+              btn.style.color = '';
+            }, 1500);
+          });
+        }
+      </script>
     </main>
   `;
   return c.html(layout('Agents', content, navBar('agents')));
@@ -462,6 +655,165 @@ webRoutes.post('/agents/:id/delete', async (c) => {
   return redirect('/agents');
 });
 
+// Agent detail page (proxy tokens)
+webRoutes.get('/agents/:id', async (c) => {
+  const clientId = await getSessionClient(c);
+  if (!clientId) return redirect('/login');
+  
+  const id = c.req.param('id');
+  const agents = await db.listAgents(c.env.DB, clientId);
+  const agent = agents.find(a => a.id === id);
+  
+  if (!agent) {
+    return c.redirect('/agents');
+  }
+  
+  const fakeTokens = await db.listFakeTokens(c.env.DB, id);
+  
+  const providers = ['openai', 'anthropic', 'github', 'notion', 'gemini', 'cloudflare', 'brave', 'aws'];
+  
+  const tokenRows = raw(fakeTokens.map(t => html`
+    <tr>
+      <td><strong>${t.provider}</strong></td>
+      <td>
+        <code class="token">${t.token}</code>
+        <button type="button" class="btn btn-ghost btn-sm" style="margin-left: 0.5rem; padding: 0.25rem 0.5rem;" 
+                onclick="copyToken('${t.token}', this)">Copy</button>
+      </td>
+      <td class="text-muted">${t.created_at.split('T')[0]}</td>
+      <td class="text-muted">${t.last_used_at?.split('T')[0] || 'Never'}</td>
+      <td>
+        <form method="POST" action="/agents/${id}/tokens/${t.provider}/renew" style="margin: 0; display: inline;">
+          <button type="submit" class="btn btn-ghost btn-sm">Renew</button>
+        </form>
+      </td>
+    </tr>
+  `).join(''));
+  
+  const existingProviders = new Set(fakeTokens.map(t => t.provider));
+  const availableProviders = providers.filter(p => !existingProviders.has(p));
+  
+  const content = html`
+    <main>
+      <div class="container">
+        <div class="flex justify-between items-center mb-2">
+          <h1>Agent: ${agent.name}</h1>
+          <a href="/agents" class="btn btn-ghost">← Back</a>
+        </div>
+        
+        <div class="card">
+          <h3>Agent Token</h3>
+          <p class="text-muted mb-2">Use this token for direct API access (secrets, list, etc.)</p>
+          <div class="flex gap-2 items-center">
+            <code class="token" style="padding: 0.5rem;">${agent.token}</code>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="copyToken('${agent.token}', this)">Copy</button>
+          </div>
+        </div>
+        
+        <div class="card">
+          <h3>Proxy Tokens</h3>
+          <p class="text-muted mb-2">Use these tokens with the passthrough proxy. Each token works only for its provider.</p>
+          
+          ${fakeTokens.length === 0 ? html`
+            <div class="empty"><p>No proxy tokens generated yet</p></div>
+          ` : html`
+            <table>
+              <thead><tr><th>Provider</th><th>Token</th><th>Created</th><th>Last Used</th><th></th></tr></thead>
+              <tbody>${tokenRows}</tbody>
+            </table>
+          `}
+          
+          ${availableProviders.length > 0 ? html`
+            <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border);">
+              <h4>Generate New Token</h4>
+              <form method="POST" action="/agents/${id}/tokens" class="flex gap-2" style="margin-top: 0.5rem;">
+                <select name="provider" required style="flex: 1;">
+                  ${raw(availableProviders.map(p => `<option value="${p}">${p}</option>`).join(''))}
+                </select>
+                <button type="submit" class="btn btn-primary">Generate</button>
+              </form>
+            </div>
+          ` : ''}
+        </div>
+        
+        <div class="card">
+          <h3>Usage Examples</h3>
+          <pre style="background: var(--bg-tertiary); padding: 1rem; border-radius: 0.375rem; overflow-x: auto;"><code># OpenAI via proxy (Python)
+from openai import OpenAI
+client = OpenAI(
+    api_key="seks_openai_...",
+    base_url="https://seks-broker.stcredzero.workers.dev/api/openai"
+)
+
+# GitHub via proxy (curl)
+curl https://seks-broker.stcredzero.workers.dev/api/github/user \\
+  -H "Authorization: Bearer seks_github_..."
+
+# AWS S3 via proxy (curl)
+# URL format: /api/aws/s3/&lt;region&gt;/&lt;bucket&gt;/&lt;key&gt;
+curl https://seks-broker.stcredzero.workers.dev/api/aws/s3/us-west-2/my-bucket/my-file.txt \\
+  -H "Authorization: Bearer seks_aws_..."
+
+# Brave Search
+curl "https://seks-broker.stcredzero.workers.dev/api/brave/res/v1/web/search?q=test" \\
+  -H "Authorization: Bearer seks_brave_..."</code></pre>
+        </div>
+      </div>
+      <script>
+        function copyToken(token, btn) {
+          navigator.clipboard.writeText(token).then(() => {
+            const orig = btn.textContent;
+            btn.textContent = 'Copied!';
+            btn.style.color = 'var(--accent)';
+            setTimeout(() => {
+              btn.textContent = orig;
+              btn.style.color = '';
+            }, 1500);
+          });
+        }
+      </script>
+    </main>
+  `;
+  return c.html(layout(`Agent: ${agent.name}`, content, navBar('agents')));
+});
+
+// Generate fake token
+webRoutes.post('/agents/:id/tokens', async (c) => {
+  const clientId = await getSessionClient(c);
+  if (!clientId) return redirect('/login');
+  
+  const id = c.req.param('id');
+  const body = await c.req.parseBody();
+  const provider = body.provider as string;
+  
+  // Verify agent belongs to this client
+  const agents = await db.listAgents(c.env.DB, clientId);
+  if (!agents.find(a => a.id === id)) {
+    return redirect('/agents');
+  }
+  
+  await db.createFakeToken(c.env.DB, id, provider);
+  return c.redirect(`/agents/${id}`);
+});
+
+// Renew fake token
+webRoutes.post('/agents/:id/tokens/:provider/renew', async (c) => {
+  const clientId = await getSessionClient(c);
+  if (!clientId) return redirect('/login');
+  
+  const id = c.req.param('id');
+  const provider = c.req.param('provider');
+  
+  // Verify agent belongs to this client
+  const agents = await db.listAgents(c.env.DB, clientId);
+  if (!agents.find(a => a.id === id)) {
+    return redirect('/agents');
+  }
+  
+  await db.createFakeToken(c.env.DB, id, provider);
+  return c.redirect(`/agents/${id}`);
+});
+
 // Activity log
 webRoutes.get('/activity', async (c) => {
   const clientId = await getSessionClient(c);
@@ -469,7 +821,7 @@ webRoutes.get('/activity', async (c) => {
   
   const entries = await db.listAudit(c.env.DB, clientId, 100);
   
-  const rows = entries.map(e => html`
+  const rows = raw(entries.map(e => html`
     <tr>
       <td class="text-muted">${e.created_at.replace('T', ' ').split('.')[0]}</td>
       <td>${e.agent_id || '-'}</td>
@@ -477,7 +829,7 @@ webRoutes.get('/activity', async (c) => {
       <td>${e.resource ? html`<code class="token">${e.resource}</code>` : '-'}</td>
       <td><span class="badge ${e.status === 'success' ? 'badge-success' : 'badge-muted'}">${e.status}</span></td>
     </tr>
-  `).join('');
+  `).join(''));
   
   const content = html`
     <main>

@@ -18,9 +18,15 @@ const app = new Hono<{ Bindings: Env }>();
 // Middleware
 app.use('*', logger());
 app.use('/v1/*', cors());
+app.use('/api/*', cors());
 
-// API routes (for agents)
+// API routes (for agents) - /v1/secrets/*, /v1/proxy/*, etc.
 app.route('/v1', apiRoutes);
+
+// Passthrough proxy also available at /api/* (cleaner URLs)
+// These routes are defined in apiRoutes as /api/openai/*, etc.
+// Mounting apiRoutes at '' makes them available at /api/*
+app.route('', apiRoutes);
 
 // Web UI routes (for humans)
 app.route('/', webRoutes);

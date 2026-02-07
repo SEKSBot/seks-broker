@@ -56,6 +56,11 @@ export async function getAgentByToken(db: D1Database, token: string): Promise<Ag
   return result ?? null;
 }
 
+export async function getAgentById(db: D1Database, id: string): Promise<Agent | null> {
+  const result = await db.prepare('SELECT * FROM agents WHERE id = ?').bind(id).first<Agent>();
+  return result ?? null;
+}
+
 export async function listAgents(db: D1Database, clientId: string): Promise<Agent[]> {
   const result = await db.prepare(
     'SELECT * FROM agents WHERE client_id = ? ORDER BY created_at DESC'
@@ -110,6 +115,33 @@ export async function listSecrets(db: D1Database, clientId: string): Promise<Sec
 
 export async function deleteSecret(db: D1Database, id: string, clientId: string): Promise<void> {
   await db.prepare('DELETE FROM secrets WHERE id = ? AND client_id = ?').bind(id, clientId).run();
+}
+
+export async function getSecretById(db: D1Database, id: string, clientId: string): Promise<Secret | null> {
+  const result = await db.prepare(
+    'SELECT * FROM secrets WHERE id = ? AND client_id = ?'
+  ).bind(id, clientId).first<Secret>();
+  return result ?? null;
+}
+
+export async function updateSecret(
+  db: D1Database,
+  id: string,
+  clientId: string,
+  name: string,
+  provider: string,
+  encryptedValue?: string
+): Promise<void> {
+  const now = new Date().toISOString();
+  if (encryptedValue) {
+    await db.prepare(
+      'UPDATE secrets SET name = ?, provider = ?, encrypted_value = ?, updated_at = ? WHERE id = ? AND client_id = ?'
+    ).bind(name, provider, encryptedValue, now, id, clientId).run();
+  } else {
+    await db.prepare(
+      'UPDATE secrets SET name = ?, provider = ?, updated_at = ? WHERE id = ? AND client_id = ?'
+    ).bind(name, provider, now, id, clientId).run();
+  }
 }
 
 // ─── Audit Log ─────────────────────────────────────────────────────────────────
@@ -168,4 +200,58 @@ export async function getSession(db: D1Database, id: string): Promise<Session | 
 
 export async function deleteSession(db: D1Database, id: string): Promise<void> {
   await db.prepare('DELETE FROM sessions WHERE id = ?').bind(id).run();
+}
+
+// ─── Fake Tokens ───────────────────────────────────────────────────────────────
+
+export interface FakeToken {
+  id: string;
+  agent_id: string;
+  provider: string;
+  token: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export async function createFakeToken(
+  db: D1Database,
+  agentId: string,
+  provider: string
+): Promise<FakeToken> {
+  const id = generateId();
+  const token = `seks_${provider}_${generateToken('').slice(0, 24)}`; // e.g., seks_openai_abc123...
+  const now = new Date().toISOString();
+  
+  // Delete existing token for this agent+provider (upsert behavior)
+  await db.prepare('DELETE FROM fake_tokens WHERE agent_id = ? AND provider = ?')
+    .bind(agentId, provider).run();
+  
+  await db.prepare(
+    'INSERT INTO fake_tokens (id, agent_id, provider, token, created_at) VALUES (?, ?, ?, ?, ?)'
+  ).bind(id, agentId, provider, token, now).run();
+  
+  return { id, agent_id: agentId, provider, token, created_at: now, last_used_at: null };
+}
+
+export async function getFakeTokenByToken(db: D1Database, token: string): Promise<FakeToken | null> {
+  const result = await db.prepare('SELECT * FROM fake_tokens WHERE token = ?')
+    .bind(token).first<FakeToken>();
+  return result ?? null;
+}
+
+export async function listFakeTokens(db: D1Database, agentId: string): Promise<FakeToken[]> {
+  const result = await db.prepare('SELECT * FROM fake_tokens WHERE agent_id = ? ORDER BY provider')
+    .bind(agentId).all<FakeToken>();
+  return result.results ?? [];
+}
+
+export async function deleteFakeToken(db: D1Database, id: string, agentId: string): Promise<void> {
+  await db.prepare('DELETE FROM fake_tokens WHERE id = ? AND agent_id = ?')
+    .bind(id, agentId).run();
+}
+
+export async function updateFakeTokenLastUsed(db: D1Database, id: string): Promise<void> {
+  const now = new Date().toISOString();
+  await db.prepare('UPDATE fake_tokens SET last_used_at = ? WHERE id = ?')
+    .bind(now, id).run();
 }

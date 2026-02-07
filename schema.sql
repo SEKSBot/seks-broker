@@ -54,6 +54,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Fake tokens (proxy passthrough tokens)
+CREATE TABLE IF NOT EXISTS fake_tokens (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    token TEXT UNIQUE NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_used_at TEXT,
+    UNIQUE(agent_id, provider)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_agents_client ON agents(client_id);
 CREATE INDEX IF NOT EXISTS idx_agents_token ON agents(token);
@@ -61,3 +72,5 @@ CREATE INDEX IF NOT EXISTS idx_secrets_client ON secrets(client_id);
 CREATE INDEX IF NOT EXISTS idx_audit_client ON audit_log(client_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_client ON sessions(client_id);
+CREATE INDEX IF NOT EXISTS idx_fake_tokens_token ON fake_tokens(token);
+CREATE INDEX IF NOT EXISTS idx_fake_tokens_agent ON fake_tokens(agent_id);
