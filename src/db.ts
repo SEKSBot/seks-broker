@@ -99,14 +99,41 @@ export async function createSecret(
   };
 }
 
-export async function getSecret(db: D1Database, clientId: string, name: string): Promise<Secret | null> {
+export async function getSecret(db: D1Database, clientId: string, name: string, agentId?: string): Promise<Secret | null> {
+  if (agentId) {
+    // Agent access: global secrets OR secrets explicitly granted to this agent
+    const result = await db.prepare(`
+      SELECT s.* FROM secrets s
+      WHERE s.client_id = ? AND s.name = ?
+        AND (
+          NOT EXISTS (SELECT 1 FROM secret_access sa WHERE sa.secret_id = s.id)
+          OR EXISTS (SELECT 1 FROM secret_access sa WHERE sa.secret_id = s.id AND sa.agent_id = ?)
+        )
+    `).bind(clientId, name, agentId).first<Secret>();
+    return result ?? null;
+  }
+  // Admin access: all secrets
   const result = await db.prepare(
     'SELECT * FROM secrets WHERE client_id = ? AND name = ?'
   ).bind(clientId, name).first<Secret>();
   return result ?? null;
 }
 
-export async function listSecrets(db: D1Database, clientId: string): Promise<Secret[]> {
+export async function listSecrets(db: D1Database, clientId: string, agentId?: string): Promise<Secret[]> {
+  if (agentId) {
+    // Agent access: global secrets OR secrets explicitly granted to this agent
+    const result = await db.prepare(`
+      SELECT s.* FROM secrets s
+      WHERE s.client_id = ?
+        AND (
+          NOT EXISTS (SELECT 1 FROM secret_access sa WHERE sa.secret_id = s.id)
+          OR EXISTS (SELECT 1 FROM secret_access sa WHERE sa.secret_id = s.id AND sa.agent_id = ?)
+        )
+      ORDER BY s.name
+    `).bind(clientId, agentId).all<Secret>();
+    return result.results ?? [];
+  }
+  // Admin access: all secrets
   const result = await db.prepare(
     'SELECT * FROM secrets WHERE client_id = ? ORDER BY name'
   ).bind(clientId).all<Secret>();
@@ -254,4 +281,44 @@ export async function updateFakeTokenLastUsed(db: D1Database, id: string): Promi
   const now = new Date().toISOString();
   await db.prepare('UPDATE fake_tokens SET last_used_at = ? WHERE id = ?')
     .bind(now, id).run();
+}
+
+// ─── Secret Access (Agent Permissions) ─────────────────────────────────────────
+
+export interface SecretAccess {
+  secret_id: string;
+  agent_id: string;
+  created_at: string;
+}
+
+export async function getSecretAccess(db: D1Database, secretId: string): Promise<SecretAccess[]> {
+  const result = await db.prepare(
+    'SELECT * FROM secret_access WHERE secret_id = ?'
+  ).bind(secretId).all<SecretAccess>();
+  return result.results ?? [];
+}
+
+export async function setSecretAccess(db: D1Database, secretId: string, agentIds: string[]): Promise<void> {
+  // Clear existing access
+  await db.prepare('DELETE FROM secret_access WHERE secret_id = ?').bind(secretId).run();
+  
+  // If empty array, secret becomes global (no entries = all agents can access)
+  if (agentIds.length === 0) {
+    return;
+  }
+  
+  // Add new access entries
+  const now = new Date().toISOString();
+  for (const agentId of agentIds) {
+    await db.prepare(
+      'INSERT INTO secret_access (secret_id, agent_id, created_at) VALUES (?, ?, ?)'
+    ).bind(secretId, agentId, now).run();
+  }
+}
+
+export async function isSecretGlobal(db: D1Database, secretId: string): Promise<boolean> {
+  const result = await db.prepare(
+    'SELECT COUNT(*) as count FROM secret_access WHERE secret_id = ?'
+  ).bind(secretId).first<{ count: number }>();
+  return (result?.count ?? 0) === 0;
 }

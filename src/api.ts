@@ -111,7 +111,8 @@ apiRoutes.post('/secrets/get', async (c) => {
     return c.json({ ok: false, error: 'Missing "name" field' }, 400);
   }
   
-  const secret = await db.getSecret(c.env.DB, agent.client_id, body.name);
+  // Pass agent.id to filter by access permissions
+  const secret = await db.getSecret(c.env.DB, agent.client_id, body.name, agent.id);
   if (!secret) {
     await db.logAudit(c.env.DB, agent.client_id, agent.id, 'secret.get', body.name, 'not_found');
     return c.json({ ok: false, error: `Secret '${body.name}' not found` }, 404);
@@ -134,7 +135,8 @@ apiRoutes.post('/secrets/list', async (c) => {
     return c.json({ ok: false, secrets: [] }, 401);
   }
   
-  const secrets = await db.listSecrets(c.env.DB, agent.client_id);
+  // Pass agent.id to filter by access permissions
+  const secrets = await db.listSecrets(c.env.DB, agent.client_id, agent.id);
   const secretInfos = secrets.map(s => ({ name: s.name, provider: s.provider }));
   
   await db.logAudit(c.env.DB, agent.client_id, agent.id, 'secret.list', null, 'success');
@@ -203,10 +205,10 @@ apiRoutes.post('/proxy/request', async (c) => {
     return c.json({ ok: false, error: `Unknown service: ${body.service}` }, 400);
   }
   
-  // Get the API key
-  const secret = await db.getSecret(c.env.DB, agent.client_id, config.secretName);
+  // Get the API key (with agent access check)
+  const secret = await db.getSecret(c.env.DB, agent.client_id, config.secretName, agent.id);
   if (!secret) {
-    return c.json({ ok: false, error: `No ${config.secretName} configured` }, 404);
+    return c.json({ ok: false, error: `No ${config.secretName} configured (or agent lacks access)` }, 404);
   }
   
   let apiKey: string;
@@ -329,10 +331,10 @@ async function handlePassthrough(c: any, provider: string) {
   c.executionCtx.waitUntil(db.updateAgentLastSeen(c.env.DB, agentRecord.id));
   c.executionCtx.waitUntil(db.updateFakeTokenLastUsed(c.env.DB, fakeToken.id));
 
-  // Get the real API key
-  const secret = await db.getSecret(c.env.DB, agentRecord.client_id, config.secretName);
+  // Get the real API key (with agent access check)
+  const secret = await db.getSecret(c.env.DB, agentRecord.client_id, config.secretName, agentRecord.id);
   if (!secret) {
-    return c.json({ error: `No ${config.secretName} configured for this account` }, 404);
+    return c.json({ error: `No ${config.secretName} configured for this account (or agent lacks access)` }, 404);
   }
 
   let apiKey: string;
@@ -464,12 +466,12 @@ apiRoutes.all('/api/aws/s3/:region/*', async (c) => {
   c.executionCtx.waitUntil(db.updateAgentLastSeen(c.env.DB, agentRecord.id));
   c.executionCtx.waitUntil(db.updateFakeTokenLastUsed(c.env.DB, fakeToken.id));
 
-  // Get AWS credentials
-  const accessKeySecret = await db.getSecret(c.env.DB, agentRecord.client_id, 'AWS_ACCESS_KEY_ID');
-  const secretKeySecret = await db.getSecret(c.env.DB, agentRecord.client_id, 'AWS_SECRET_ACCESS_KEY');
+  // Get AWS credentials (with agent access check)
+  const accessKeySecret = await db.getSecret(c.env.DB, agentRecord.client_id, 'AWS_ACCESS_KEY_ID', agentRecord.id);
+  const secretKeySecret = await db.getSecret(c.env.DB, agentRecord.client_id, 'AWS_SECRET_ACCESS_KEY', agentRecord.id);
   
   if (!accessKeySecret || !secretKeySecret) {
-    return c.json({ error: 'AWS credentials not configured' }, 404);
+    return c.json({ error: 'AWS credentials not configured (or agent lacks access)' }, 404);
   }
 
   let accessKeyId: string;

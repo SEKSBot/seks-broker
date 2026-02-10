@@ -277,23 +277,38 @@ webRoutes.get('/secrets', async (c) => {
   if (!clientId) return redirect('/login');
   
   const secrets = await db.listSecrets(c.env.DB, clientId);
+  const agents = await db.listAgents(c.env.DB, clientId);
+  const agentMap = new Map(agents.map(a => [a.id, a.name]));
   
-  const rows = raw(secrets.map(s => html`
-    <tr>
-      <td><code class="token">${s.name}</code></td>
-      <td>${s.provider}</td>
-      <td class="text-muted">${s.created_at.split('T')[0]}</td>
-      <td>
-        <div class="flex gap-2">
-          <a href="/secrets/${s.id}/reveal" class="btn btn-ghost btn-sm">Reveal</a>
-          <a href="/secrets/${s.id}/edit" class="btn btn-ghost btn-sm">Edit</a>
-          <form method="POST" action="/secrets/${s.id}/delete" onsubmit="return confirm('Delete this secret?');" style="margin: 0;">
-            <button type="submit" class="btn btn-danger btn-sm">Delete</button>
-          </form>
-        </div>
-      </td>
-    </tr>
-  `).join(''));
+  // Get access info for each secret
+  const secretsWithAccess = await Promise.all(secrets.map(async s => {
+    const access = await db.getSecretAccess(c.env.DB, s.id);
+    return { ...s, access };
+  }));
+  
+  const rows = raw(secretsWithAccess.map(s => {
+    const accessBadge = s.access.length === 0 
+      ? html`<span class="badge badge-success">All agents</span>`
+      : html`<span class="badge badge-muted">${s.access.map(a => agentMap.get(a.agent_id) || 'Unknown').join(', ')}</span>`;
+    
+    return html`
+      <tr>
+        <td><code class="token">${s.name}</code></td>
+        <td>${s.provider}</td>
+        <td>${accessBadge}</td>
+        <td class="text-muted">${s.created_at.split('T')[0]}</td>
+        <td>
+          <div class="flex gap-2">
+            <a href="/secrets/${s.id}/reveal" class="btn btn-ghost btn-sm">Reveal</a>
+            <a href="/secrets/${s.id}/edit" class="btn btn-ghost btn-sm">Edit</a>
+            <form method="POST" action="/secrets/${s.id}/delete" onsubmit="return confirm('Delete this secret?');" style="margin: 0;">
+              <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join(''));
   
   const content = html`
     <main>
@@ -310,7 +325,7 @@ webRoutes.get('/secrets', async (c) => {
             </div>
           ` : html`
             <table>
-              <thead><tr><th>Name</th><th>Provider</th><th>Created</th><th></th></tr></thead>
+              <thead><tr><th>Name</th><th>Provider</th><th>Access</th><th>Created</th><th></th></tr></thead>
               <tbody>${rows}</tbody>
             </table>
           `}
@@ -325,6 +340,15 @@ webRoutes.get('/secrets', async (c) => {
 webRoutes.get('/secrets/add', async (c) => {
   const clientId = await getSessionClient(c);
   if (!clientId) return redirect('/login');
+  
+  const agents = await db.listAgents(c.env.DB, clientId);
+  
+  const agentCheckboxes = agents.length > 0 ? raw(agents.map(a => html`
+    <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+      <input type="checkbox" name="agents" value="${a.id}">
+      <span>${a.name}</span>
+    </label>
+  `).join('')) : html`<p class="text-muted">No agents created yet. <a href="/agents">Create one first.</a></p>`;
   
   const content = html`
     <main>
@@ -361,6 +385,19 @@ webRoutes.get('/secrets/add', async (c) => {
               </div>
               <small class="text-muted">Will be encrypted before storage</small>
             </div>
+            <div class="form-group">
+              <label>Agent Access</label>
+              <div style="background: var(--bg-tertiary); padding: 1rem; border-radius: 0.375rem; border: 1px solid var(--border);">
+                <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;">
+                  <input type="checkbox" id="globalAccess" checked onchange="toggleAgentSelection()">
+                  <strong>All agents</strong> <span class="text-muted">(global)</span>
+                </label>
+                <div id="agentSelection" style="display: none; padding-left: 1.5rem; border-left: 2px solid var(--border);">
+                  ${agentCheckboxes}
+                </div>
+              </div>
+              <small class="text-muted">Global secrets are available to all agents. Uncheck to restrict access.</small>
+            </div>
             <script>
               function toggleSecret() {
                 const input = document.getElementById('value');
@@ -371,6 +408,15 @@ webRoutes.get('/secrets/add', async (c) => {
                 } else {
                   input.type = 'password';
                   btn.textContent = 'Show';
+                }
+              }
+              function toggleAgentSelection() {
+                const global = document.getElementById('globalAccess');
+                const selection = document.getElementById('agentSelection');
+                selection.style.display = global.checked ? 'none' : 'block';
+                // Uncheck all agents when switching to global
+                if (global.checked) {
+                  document.querySelectorAll('input[name="agents"]').forEach(cb => cb.checked = false);
                 }
               }
             </script>
@@ -396,8 +442,18 @@ webRoutes.post('/secrets/add', async (c) => {
   const provider = body.provider as string;
   const value = body.value as string;
   
+  // Get selected agents (empty array = global)
+  let agentIds: string[] = [];
+  const agents = body.agents;
+  if (agents) {
+    agentIds = Array.isArray(agents) ? agents as string[] : [agents as string];
+  }
+  
   const encrypted = await encrypt(value, getMasterKey(c.env));
-  await db.createSecret(c.env.DB, clientId, name, provider, encrypted);
+  const secret = await db.createSecret(c.env.DB, clientId, name, provider, encrypted);
+  
+  // Set agent access (empty = global)
+  await db.setSecretAccess(c.env.DB, secret.id, agentIds);
   
   return redirect('/secrets');
 });
@@ -424,6 +480,11 @@ webRoutes.get('/secrets/:id/edit', async (c) => {
     return c.redirect('/secrets');
   }
   
+  const agents = await db.listAgents(c.env.DB, clientId);
+  const currentAccess = await db.getSecretAccess(c.env.DB, id);
+  const currentAgentIds = new Set(currentAccess.map(a => a.agent_id));
+  const isGlobal = currentAccess.length === 0;
+  
   const providers = [
     { value: 'anthropic', label: 'Anthropic (Claude)' },
     { value: 'openai', label: 'OpenAI' },
@@ -441,6 +502,13 @@ webRoutes.get('/secrets/:id/edit', async (c) => {
   const providerOptions = raw(providers.map(p => 
     `<option value="${p.value}"${p.value === secret.provider ? ' selected' : ''}>${p.label}</option>`
   ).join(''));
+  
+  const agentCheckboxes = agents.length > 0 ? raw(agents.map(a => html`
+    <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+      <input type="checkbox" name="agents" value="${a.id}" ${currentAgentIds.has(a.id) ? 'checked' : ''}>
+      <span>${a.name}</span>
+    </label>
+  `).join('')) : html`<p class="text-muted">No agents created yet.</p>`;
   
   const content = html`
     <main>
@@ -465,6 +533,18 @@ webRoutes.get('/secrets/:id/edit', async (c) => {
                 <button type="button" onclick="toggleSecret()" class="btn btn-ghost" id="toggleBtn">Show</button>
               </div>
             </div>
+            <div class="form-group">
+              <label>Agent Access</label>
+              <div style="background: var(--bg-tertiary); padding: 1rem; border-radius: 0.375rem; border: 1px solid var(--border);">
+                <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;">
+                  <input type="checkbox" id="globalAccess" ${isGlobal ? 'checked' : ''} onchange="toggleAgentSelection()">
+                  <strong>All agents</strong> <span class="text-muted">(global)</span>
+                </label>
+                <div id="agentSelection" style="display: ${isGlobal ? 'none' : 'block'}; padding-left: 1.5rem; border-left: 2px solid var(--border);">
+                  ${agentCheckboxes}
+                </div>
+              </div>
+            </div>
             <div class="flex gap-2">
               <button type="submit" class="btn btn-primary">Save Changes</button>
               <a href="/secrets" class="btn btn-ghost">Cancel</a>
@@ -484,6 +564,14 @@ webRoutes.get('/secrets/:id/edit', async (c) => {
             btn.textContent = 'Show';
           }
         }
+        function toggleAgentSelection() {
+          const global = document.getElementById('globalAccess');
+          const selection = document.getElementById('agentSelection');
+          selection.style.display = global.checked ? 'none' : 'block';
+          if (global.checked) {
+            document.querySelectorAll('input[name="agents"]').forEach(cb => cb.checked = false);
+          }
+        }
       </script>
     </main>
   `;
@@ -501,6 +589,13 @@ webRoutes.post('/secrets/:id/edit', async (c) => {
   const provider = body.provider as string;
   const value = body.value as string;
   
+  // Get selected agents (empty array = global)
+  let agentIds: string[] = [];
+  const agents = body.agents;
+  if (agents) {
+    agentIds = Array.isArray(agents) ? agents as string[] : [agents as string];
+  }
+  
   // Only encrypt new value if provided
   let encryptedValue: string | undefined;
   if (value && value.trim()) {
@@ -508,6 +603,10 @@ webRoutes.post('/secrets/:id/edit', async (c) => {
   }
   
   await db.updateSecret(c.env.DB, id, clientId, name, provider, encryptedValue);
+  
+  // Update agent access
+  await db.setSecretAccess(c.env.DB, id, agentIds);
+  
   return c.redirect('/secrets');
 });
 

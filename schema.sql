@@ -65,7 +65,19 @@ CREATE TABLE IF NOT EXISTS fake_tokens (
     UNIQUE(agent_id, provider)
 );
 
+-- Secret access (junction table for per-agent secrets)
+-- If a secret has NO entries here, it's global (all agents can access)
+-- If it has entries, only those agents can access it
+CREATE TABLE IF NOT EXISTS secret_access (
+    secret_id TEXT NOT NULL REFERENCES secrets(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (secret_id, agent_id)
+);
+
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_secret_access_secret ON secret_access(secret_id);
+CREATE INDEX IF NOT EXISTS idx_secret_access_agent ON secret_access(agent_id);
 CREATE INDEX IF NOT EXISTS idx_agents_client ON agents(client_id);
 CREATE INDEX IF NOT EXISTS idx_agents_token ON agents(token);
 CREATE INDEX IF NOT EXISTS idx_secrets_client ON secrets(client_id);
