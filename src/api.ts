@@ -276,6 +276,91 @@ apiRoutes.post('/proxy/request', async (c) => {
   }
 });
 
+// ─── S3 Presigned URLs ─────────────────────────────────────────────────────────
+//
+// POST /api/s3/presign
+// Generates a presigned S3 URL so agents can upload/download without AWS keys.
+
+const ALLOWED_S3_BUCKETS = new Set([
+  'seksbot-shared-lfs',
+]);
+
+apiRoutes.post('/api/s3/presign', async (c) => {
+  const agent = await authenticateAgent(c);
+  if (!agent) {
+    return c.json({ ok: false, error: 'Unauthorized' }, 401);
+  }
+
+  const body = await c.req.json<{
+    bucket: string;
+    key: string;
+    method: 'GET' | 'PUT';
+    expiresIn?: number;
+    contentType?: string;
+    region?: string;
+  }>();
+
+  // Validate required fields
+  if (!body.bucket || !body.key || !body.method) {
+    return c.json({ ok: false, error: 'Missing required fields: bucket, key, method' }, 400);
+  }
+
+  if (body.method !== 'GET' && body.method !== 'PUT') {
+    return c.json({ ok: false, error: 'method must be "GET" or "PUT"' }, 400);
+  }
+
+  // Bucket allowlist check
+  if (!ALLOWED_S3_BUCKETS.has(body.bucket)) {
+    await db.logAudit(c.env.DB, agent.client_id, agent.id, 's3.presign', body.bucket, 'denied', null, `bucket not allowed: ${body.bucket}`);
+    return c.json({ ok: false, error: `Bucket '${body.bucket}' is not in the allowlist` }, 403);
+  }
+
+  const expiresIn = Math.min(body.expiresIn || 3600, 604800); // max 7 days
+  const region = body.region || 'us-west-2';
+
+  // Get AWS credentials
+  const accessKeySecret = await db.getSecret(c.env.DB, agent.client_id, 'AWS_ACCESS_KEY_ID', agent.id);
+  const secretKeySecret = await db.getSecret(c.env.DB, agent.client_id, 'AWS_SECRET_ACCESS_KEY', agent.id);
+
+  if (!accessKeySecret || !secretKeySecret) {
+    return c.json({ ok: false, error: 'AWS credentials not configured (or agent lacks access)' }, 404);
+  }
+
+  let accessKeyId: string;
+  let secretAccessKey: string;
+  try {
+    accessKeyId = await decrypt(accessKeySecret.encrypted_value, getMasterKey(c.env));
+    secretAccessKey = await decrypt(secretKeySecret.encrypted_value, getMasterKey(c.env));
+  } catch (e) {
+    return c.json({ ok: false, error: 'Failed to decrypt AWS credentials' }, 500);
+  }
+
+  try {
+    const url = await generatePresignedUrl({
+      method: body.method,
+      bucket: body.bucket,
+      key: body.key,
+      region,
+      accessKeyId,
+      secretAccessKey,
+      expiresIn,
+      contentType: body.contentType,
+    });
+
+    await db.logAudit(
+      c.env.DB, agent.client_id, agent.id, 's3.presign',
+      `s3://${body.bucket}/${body.key}`, 'success', null,
+      `${body.method} expires=${expiresIn}s`
+    );
+
+    return c.json({ ok: true, url, expiresIn });
+  } catch (e) {
+    const error = e instanceof Error ? e.message : 'Unknown error';
+    await db.logAudit(c.env.DB, agent.client_id, agent.id, 's3.presign', body.bucket, 'error', null, error);
+    return c.json({ ok: false, error: `Failed to generate presigned URL: ${error}` }, 500);
+  }
+});
+
 // ─── Passthrough Proxy ─────────────────────────────────────────────────────────
 // 
 // Routes like /api/openai/* forward to api.openai.com with credential injection.
@@ -634,4 +719,89 @@ async function hmacSha256(key: ArrayBuffer | Uint8Array, data: string): Promise<
 async function hmacSha256Hex(key: ArrayBuffer, data: string): Promise<string> {
   const sig = await hmacSha256(key, data);
   return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ─── S3 Presigned URL Generation (Query String Auth) ────────────────────────────
+
+interface PresignParams {
+  method: string;
+  bucket: string;
+  key: string;
+  region: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  expiresIn: number;
+  contentType?: string;
+}
+
+function uriEncode(str: string, encodeSlash = true): string {
+  return str.split('').map(ch => {
+    if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+        (ch >= '0' && ch <= '9') || ch === '_' || ch === '-' || ch === '~' || ch === '.') {
+      return ch;
+    }
+    if (ch === '/' && !encodeSlash) return ch;
+    return '%' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0');
+  }).join('');
+}
+
+async function generatePresignedUrl(params: PresignParams): Promise<string> {
+  const { method, bucket, key, region, accessKeyId, secretAccessKey, expiresIn, contentType } = params;
+
+  const host = `${bucket}.s3.${region}.amazonaws.com`;
+  const path = '/' + key;
+  const algorithm = 'AWS4-HMAC-SHA256';
+
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '').slice(0, 15) + 'Z';
+  const dateStamp = amzDate.slice(0, 8);
+  const credentialScope = `${dateStamp}/${region}/s3/aws4_request`;
+  const credential = `${accessKeyId}/${credentialScope}`;
+
+  // Build canonical query string (sorted)
+  const queryParams: Record<string, string> = {
+    'X-Amz-Algorithm': algorithm,
+    'X-Amz-Credential': credential,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Expires': String(expiresIn),
+    'X-Amz-SignedHeaders': contentType ? 'content-type;host' : 'host',
+  };
+
+  const canonicalQueryString = Object.keys(queryParams)
+    .sort()
+    .map(k => `${uriEncode(k)}=${uriEncode(queryParams[k])}`)
+    .join('&');
+
+  // Canonical headers
+  let canonicalHeaders = `host:${host}\n`;
+  let signedHeaders = 'host';
+  if (contentType) {
+    canonicalHeaders = `content-type:${contentType}\nhost:${host}\n`;
+    signedHeaders = 'content-type;host';
+  }
+
+  // For presigned URLs, payload is UNSIGNED-PAYLOAD
+  const canonicalRequest = [
+    method,
+    uriEncode(path, false),
+    canonicalQueryString,
+    canonicalHeaders,
+    signedHeaders,
+    'UNSIGNED-PAYLOAD',
+  ].join('\n');
+
+  // String to sign
+  const canonicalRequestHash = await sha256Hex(new TextEncoder().encode(canonicalRequest));
+  const stringToSign = [algorithm, amzDate, credentialScope, canonicalRequestHash].join('\n');
+
+  // Derive signing key
+  const kDate = await hmacSha256(new TextEncoder().encode('AWS4' + secretAccessKey), dateStamp);
+  const kRegion = await hmacSha256(kDate, region);
+  const kService = await hmacSha256(kRegion, 's3');
+  const kSigning = await hmacSha256(kService, 'aws4_request');
+
+  // Signature
+  const signature = await hmacSha256Hex(kSigning, stringToSign);
+
+  return `https://${host}${uriEncode(path, false)}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
 }
